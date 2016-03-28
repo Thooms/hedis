@@ -8,7 +8,8 @@ import Data.Monoid (mappend)
 import Control.Concurrent
 import Control.Monad
 import Control.Monad.Trans
-import qualified Data.List as L (sort)
+import Data.ByteString (ByteString)
+import qualified Data.List as L (sort, lookup)
 import Data.Time
 import Data.Time.Clock.POSIX
 import SlaveThread (fork)
@@ -25,7 +26,9 @@ import Database.Redis
 main :: IO ()
 main = do
     conn <- connect defaultConnectInfo
-    Test.defaultMain (tests conn)
+    Right [serverSection] <- runRedis conn $ infoSection "server"
+    let Just version = L.lookup "redis_version" (isProperties serverSection)
+    Test.defaultMain (tests conn version)
 
 type Test = Connection -> Test.Test
 
@@ -55,12 +58,12 @@ assert = liftIO . HUnit.assert
 --
 -- Defines all the test groups.
 
-tests :: Connection -> [Test.Test]
-tests conn =
+tests :: Connection -> ByteString -> [Test.Test]
+tests conn version =
     [ def "Misc" testsMisc
     , def "Keys" testsKeys
     , def "Strings" testsStrings
-    , def "Hashes" testHashes
+    , versioned "Hashes" testHashes
     , def "Lists" testsLists
     , def "Sets" testsSets
     , def "HyperLogLog" [testHyperLogLog]
@@ -72,7 +75,9 @@ tests conn =
     , def "Server" testsServer
     , def "Quit" [testQuit]
     ]
-    where def name l = Test.testGroup name $ map ($ conn) l
+    where
+      def name l = Test.testGroup name $ map ($ conn) l
+      versioned name f = Test.testGroup name $ map ($conn) (f version)
 
 ------------------------------------------------------------------------------
 -- Miscellaneous
@@ -262,8 +267,9 @@ testBITPOS = testCase "BITPOS" $ do
 -- Hashes
 --
 
-testHashes :: [Test]
-testHashes = [testHashesAll, testHSTRLEN]
+testHashes :: ByteString -> [Test]
+testHashes v | v >= "3.2.0" = [testHashesAll, testHSTRLEN]
+             | otherwise    = [testHashesAll]
 
 testHashesAll :: Test
 testHashesAll = testCase "hashes" $ do
@@ -597,8 +603,8 @@ testSelect = testCase "select" $ do
 --
 testsServer :: [Test]
 testsServer =
-    [testServer, testBgrewriteaof, testFlushall, testInfo, testConfig
-    ,testSlowlog, testDebugObject]
+    [ testServer, testBgrewriteaof, testFlushall, testInfo, testInfoSection
+    , testConfig, testSlowlog, testDebugObject, testInfo]
 
 testServer :: Test
 testServer = testCase "server" $ do
@@ -627,12 +633,25 @@ testFlushall = testCase "flushall/flushdb" $ do
     flushall >>=? Ok
     flushdb  >>=? Ok
 
+assertRedisVersion :: [InfoSection] -> Redis ()
+assertRedisVersion sections = do
+    let serverSections = filter (\s -> isName s == "Server") sections
+    assert $ length serverSections == 1
+    let serverProperties = isProperties (head serverSections)
+    assert $ any((== "redis_version") . fst) serverProperties
+
 testInfo :: Test
 testInfo = testCase "info/lastsave/dbsize" $ do
-    Right _ <- info
+    Right sections <- info
+    assertRedisVersion sections
     Right _ <- lastsave
     dbsize          >>=? 0
     configResetstat >>=? Ok
+
+testInfoSection :: Test
+testInfoSection = testCase "info/lastsave/dbsize" $ do
+    Right sections <- infoSection "server"
+    assertRedisVersion sections
 
 testSlowlog :: Test
 testSlowlog = testCase "slowlog" $ do
